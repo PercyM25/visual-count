@@ -50,11 +50,11 @@ ol{padding-left:1.3em;margin:8px 0}
 <main class="wrap">
   <header>
     <h1>AI Calculator</h1>
-    <p class="sub">Point your camera at a sum, a receipt or a price tag. Claude reads it, and the total is checked locally.</p>
+    <p class="sub">Point your camera at a sum, a receipt or a price tag. DailyCal reads it, and the total is checked locally.</p>
   </header>
 
   <section class="card">
-    <video id="video" playsinline muted hidden></video>
+    <video id="video" autoplay playsinline muted hidden></video>
     <canvas id="canvas" hidden></canvas>
     <div class="row">
       <button id="camBtn" class="btn">Start camera</button>
@@ -249,8 +249,12 @@ function evaluate(src) {
 async function startCamera() {
   try {
     stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
-    $('video').srcObject = stream;
-    $('video').hidden = false;
+    const v = $('video');
+    v.srcObject = stream;
+    v.hidden = false;
+    v.muted = true;
+    await new Promise(r => { if (v.readyState >= 1) r(); else v.onloadedmetadata = () => r(); });
+    try { await v.play(); } catch (e) { /* the tap that started the camera normally allows playback */ }
     $('camBtn').textContent = 'Stop camera';
     setBusy(false);
     setStatus('Camera ready. Frame the sum or price tags and snap.');
