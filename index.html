@@ -77,7 +77,7 @@ ol{padding-left:1.3em;margin:8px 0}
         <input id="tax" type="number" min="0" step="0.1" value="0">
       </label>
     </div>
-    <p id="status" class="status" role="status" aria-live="polite">Loading photo reading...</p>
+    <p id="status" class="status" role="status" aria-live="polite">Starting...</p>
   </section>
 
   <section class="card">
@@ -109,6 +109,7 @@ ol{padding-left:1.3em;margin:8px 0}
 const $ = id => document.getElementById(id);
 let stream = null;
 let sampleFn = null;
+let readerReady = null;
 let history = [];
 
 // Address of the Cloudflare Worker that holds the Gemini key
@@ -172,4 +173,338 @@ function cleanExpr(s) {
 function tokenize(s) {
   const t = [];
   let i = 0;
-  while (i
+  while (i < s.length) {
+    const c = s[i];
+    if (/[0-9.]/.test(c)) {
+      let j = i;
+      while (j < s.length && /[0-9.]/.test(s[j])) j++;
+      const n = parseFloat(s.slice(i, j));
+      if (isNaN(n)) throw new Error('A number could not be read');
+      t.push({ k: 'n', v: n });
+      i = j;
+    } else if ('+-*/^%()'.includes(c)) {
+      t.push({ k: c });
+      i++;
+    } else {
+      throw new Error('Unsupported character: ' + c);
+    }
+  }
+  return t;
+}
+
+function evaluate(src) {
+  const t = tokenize(normalise(src));
+  if (!t.length) throw new Error('Nothing to calculate yet');
+  let p = 0;
+  const peek = () => (t[p] ? t[p].k : null);
+  const eat = k => { if (peek() === k) { p++; return true; } return false; };
+
+  function expr() {
+    let v = term();
+    while (peek() === '+' || peek() === '-') {
+      const op = t[p++].k;
+      const r = term();
+      v = op === '+' ? v + r : v - r;
+    }
+    return v;
+  }
+  function term() {
+    let v = unary();
+    while (peek() === '*' || peek() === '/') {
+      const op = t[p++].k;
+      const r = unary();
+      if (op === '/' && r === 0) throw new Error('Cannot divide by zero');
+      v = op === '*' ? v * r : v / r;
+    }
+    return v;
+  }
+  function unary() {
+    if (eat('-')) return -unary();
+    if (eat('+')) return unary();
+    return power();
+  }
+  function power() {
+    const b = postfix();
+    if (eat('^')) return Math.pow(b, unary());
+    return b;
+  }
+  function postfix() {
+    let v = factor();
+    while (eat('%')) v = v / 100;
+    return v;
+  }
+  function factor() {
+    if (peek() === 'n') return t[p++].v;
+    if (eat('(')) {
+      const v = expr();
+      if (!eat(')')) throw new Error('A bracket is missing');
+      return v;
+    }
+    throw new Error('The expression is incomplete');
+  }
+
+  const v = expr();
+  if (p !== t.length) throw new Error('The expression could not be read to the end');
+  if (!isFinite(v)) throw new Error('The result is too large');
+  return v;
+}
+
+/* ---------- Setting up photo reading ---------- */
+// Connects photo reading once. Inside claude.ai it uses the built-in connection;
+// on GitHub Pages it uses the Cloudflare Worker. It never blocks the camera.
+function setupReader() {
+  if (readerReady) return readerReady;
+  readerReady = (async () => {
+    if (window.claude && typeof window.claude.use === 'function') {
+      try {
+        const s = await Promise.race([
+          window.claude.use('sample'),
+          new Promise(r => setTimeout(() => r(null), 4000))
+        ]);
+        if (s) sampleFn = s;
+      } catch (e) {
+        sampleFn = null;
+      }
+    }
+    if (!sampleFn && PROXY_URL) sampleFn = proxySample;
+    $('upload').disabled = !sampleFn;
+    return sampleFn;
+  })();
+  return readerReady;
+}
+
+/* ---------- Camera and photo input ---------- */
+async function startCamera() {
+  setStatus('Starting camera...');
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+    const v = $('video');
+    v.srcObject = stream;
+    v.hidden = false;
+    v.muted = true;
+    await new Promise(r => { if (v.readyState >= 1) r(); else v.onloadedmetadata = () => r(); });
+    try { await v.play(); } catch (e) { /* the tap that started the camera normally allows playback */ }
+    $('camBtn').textContent = 'Stop camera';
+    setBusy(false);
+
+    await setupReader();
+    setBusy(false);
+    if (sampleFn) {
+      setStatus('Camera ready. Frame the sum or price tags and snap.', 'ok');
+    } else {
+      setStatus('Camera ready, but photo reading is not connected. Typed sums still work.', 'err');
+    }
+  } catch (e) {
+    stream = null;
+    setStatus('The camera could not start (' + (e.name || 'error') + '). Use Upload photo instead.', 'err');
+    setBusy(false);
+  }
+}
+
+function stopCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  $('video').srcObject = null;
+  $('video').hidden = true;
+  $('camBtn').textContent = 'Start camera';
+  setBusy(false);
+  setStatus('Camera stopped.');
+}
+
+function drawToBlob(src, w, h) {
+  const max = 1024;
+  const s = Math.min(1, max / Math.max(w, h));
+  const c = $('canvas');
+  c.width = Math.round(w * s);
+  c.height = Math.round(h * s);
+  c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+  return new Promise((res, rej) =>
+    c.toBlob(b => (b ? res(b) : rej(new Error('Could not prepare the image'))), 'image/jpeg', 0.85)
+  );
+}
+
+/* ---------- Reading photos ---------- */
+function parseReply(text) {
+  const t = String(text);
+  const a = t.indexOf('{');
+  const b = t.lastIndexOf('}');
+  if (a < 0 || b < a) return null;
+  try { return JSON.parse(t.slice(a, b + 1)); } catch (e) { return null; }
+}
+
+function toNum(v) {
+  const n = parseFloat(String(v).replace(/,/g, '').replace(/[^0-9.\-]/g, ''));
+  return isNaN(n) ? 0 : n;
+}
+
+function friendly(e) {
+  if (e && e.code === 'not_granted') return 'Photo reading needs your permission. Allow it and try again, or type the sum instead.';
+  if (e && e.code === 'rate_limited') return 'Too many requests. Wait a moment and try again.';
+  return (e && e.message) || 'Something went wrong. Please try again.';
+}
+
+async function readPhoto(blob) {
+  await setupReader();
+  if (!sampleFn) {
+    setStatus('Photo reading is not connected. Typed sums still work.', 'err');
+    return;
+  }
+  const mode = $('mode').value;
+  setBusy(true);
+  setStatus('Reading photo...');
+  try {
+    const res = await sampleFn(PROMPT + '\n' + HINTS[mode], { images: [blob], modelTier: 'default', cache: false });
+    const data = parseReply(res.text);
+    if (!data) throw new Error('The reply could not be read. Try a clearer, closer photo.');
+    if (data.type === 'unclear') {
+      setStatus(data.notes || 'That photo is hard to read. Try again closer and in better light.', 'err');
+      return;
+    }
+    if (data.type === 'prices' && Array.isArray(data.items) && data.items.length) {
+      const items = data.items.map(i => ({ name: String(i.name || 'Item').slice(0, 80), price: toNum(i.price) }));
+      showResult({ kind: 'prices', expression: items.map(i => i.price).join('+'), items, steps: data.steps, notes: data.notes });
+    } else {
+      showResult({ kind: 'math', expression: cleanExpr(data.expression || ''), steps: data.steps, notes: data.notes });
+    }
+    setStatus('Done. Check the result below.', 'ok');
+  } catch (e) {
+    setStatus(friendly(e), 'err');
+  } finally {
+    setBusy(false);
+  }
+}
+
+/* ---------- Result display ---------- */
+function fmt(n, money) {
+  return Number(n).toLocaleString(undefined, {
+    minimumFractionDigits: money ? 2 : 0,
+    maximumFractionDigits: money ? 2 : 6
+  });
+}
+
+function showResult(d) {
+  const box = $('result');
+  box.hidden = false;
+  const money = d.kind === 'prices';
+  const cur = $('cur').value;
+  const card = el('div', { class: 'card' });
+  card.append(el('h2', { text: money ? 'Price total' : 'Result' }));
+
+  let value = null;
+  let total = null;
+  let err = null;
+  try {
+    value = evaluate(d.expression);
+  } catch (e) {
+    err = e.message;
+  }
+
+  if (d.items && d.items.length) {
+    const table = el('table', { class: 'items' });
+    d.items.forEach(i => table.append(el('tr', {}, el('td', { text: i.name }), el('td', { text: cur + fmt(i.price, true) }))));
+    card.append(table);
+  }
+
+  card.append(el('div', { class: 'expr', text: d.expression || '(nothing read)' }));
+
+  if (err) {
+    card.append(el('p', { class: 'status err', text: err }));
+  } else if (money) {
+    card.append(el('div', { class: 'line' }, el('span', { text: 'Subtotal' }), el('span', { text: cur + fmt(value, true) })));
+    const tax = parseFloat($('tax').value) || 0;
+    total = value;
+    if (tax > 0) {
+      const tv = value * tax / 100;
+      total = value + tv;
+      card.append(el('div', { class: 'line' }, el('span', { text: 'Tax at ' + tax + '%' }), el('span', { text: cur + fmt(tv, true) })));
+    }
+    card.append(el('div', { class: 'big', text: cur + fmt(total, true) }));
+  } else {
+    card.append(el('div', { class: 'big', text: fmt(value, false) }));
+  }
+
+  if (d.steps && d.steps.length) {
+    const ol = el('ol');
+    d.steps.slice(0, 6).forEach(s => ol.append(el('li', { text: String(s) })));
+    card.append(ol);
+  }
+  if (d.notes) card.append(el('p', { class: 'note', text: String(d.notes) }));
+
+  const row = el('div', { class: 'row' });
+  const inp = el('input', { 'aria-label': 'Expression to recalculate' });
+  inp.value = d.expression || '';
+  inp.style.flex = '1 1 220px';
+  const re = el('button', { class: 'btn', text: 'Recalculate' });
+  re.addEventListener('click', () => showResult({ kind: money ? 'prices' : 'typed', expression: cleanExpr(inp.value) }));
+  row.append(inp, re);
+  card.append(row);
+
+  box.replaceChildren(card);
+  if (value !== null) pushHistory(d.expression, cur, money ? total : value, money);
+  box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function pushHistory(expr, cur, val, money) {
+  history.unshift({ expr, text: (money ? cur : '') + fmt(val, money) });
+  history = history.slice(0, 20);
+  renderHistory();
+}
+
+function renderHistory() {
+  $('history').hidden = !history.length;
+  $('histList').replaceChildren(...history.map(h => {
+    const b = el('button', { type: 'button' });
+    b.append(el('span', { class: 'expr', text: h.expr }), el('strong', { text: '= ' + h.text }));
+    b.addEventListener('click', () => showResult({ kind: 'typed', expression: h.expr }));
+    return el('li', {}, b);
+  }));
+}
+
+/* ---------- Connection to the Cloudflare Worker (Gemini) ---------- */
+async function proxySample(text, opts) {
+  const b64 = await blobToBase64(opts.images[0]);
+  const r = await fetch(PROXY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: text, image: b64, mediaType: 'image/jpeg' })
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const e = new Error(j.error || 'Photo service error (' + r.status + ')');
+    e.code = j.code;
+    throw e;
+  }
+  return { text: j.text || '' };
+}
+
+function blobToBase64(blob) {
+  return new Promise((res, rej) => {
+    const reader = new FileReader();
+    reader.onload = () => res(String(reader.result).split(',')[1]);
+    reader.onerror = () => rej(new Error('Could not read the image'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+/* ---------- Wiring ---------- */
+$('camBtn').addEventListener('click', () => (stream ? stopCamera() : startCamera()));
+
+$('snap').addEventListener('click', async () => {
+  const v = $('video');
+  if (!v.videoWidth) return setStatus('The camera is still starting. Try again in a second.', 'err');
+  try {
+    const blob = await drawToBlob(v, v.videoWidth, v.videoHeight);
+    readPhoto(blob);
+  } catch (e) {
+    setStatus(friendly(e), 'err');
+  }
+});
+
+$('upload').addEventListener('click', () => $('file').click());
+
+$('file').addEventListener('change', async e => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  try {
+    const bmp = await
